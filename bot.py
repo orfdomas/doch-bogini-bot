@@ -38,7 +38,7 @@ CARDS_DIR = Path(__file__).parent / "cards"
 
 # ===== БАЗА ПОДПИСЧИКОВ =====
 # SQLite-файл с ID всех пользователей, которым нужно рассылать карту
-DB_PATH = Path(__file__).parent / "subscribers.db"
+DB_PATH = Path(os.getenv("DATA_DIR", Path(__file__).parent)) / "subscribers.db"
 
 # ===== РАСПИСАНИЕ РАССЫЛКИ =====
 # Московское время (UTC+3), воскресенье 20:00
