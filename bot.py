@@ -7,11 +7,14 @@
 import hashlib
 import logging
 import os
-from datetime import datetime
+import sqlite3
+from datetime import datetime, time, timezone, timedelta
 from pathlib import Path
 
 from telegram import Update
+from telegram.error import Forbidden, BadRequest
 from telegram.ext import (
+    Application,
     ApplicationBuilder,
     CommandHandler,
     ContextTypes,
@@ -32,6 +35,16 @@ BOT_TOKEN = os.getenv("BOT_TOKEN", "ВСТАВЬТЕ_СЮДА_ТОКЕН_ОТ_BO
 # ===== ПАПКА С КАРТИНКАМИ =====
 # Бот ищет картинки в папке cards/ рядом со своим файлом
 CARDS_DIR = Path(__file__).parent / "cards"
+
+# ===== БАЗА ПОДПИСЧИКОВ =====
+# SQLite-файл с ID всех пользователей, которым нужно рассылать карту
+DB_PATH = Path(__file__).parent / "subscribers.db"
+
+# ===== РАСПИСАНИЕ РАССЫЛКИ =====
+# Московское время (UTC+3), воскресенье 20:00
+MOSCOW_TZ = timezone(timedelta(hours=3))
+BROADCAST_TIME = time(hour=20, minute=0, tzinfo=MOSCOW_TZ)
+BROADCAST_WEEKDAY = 6  # 0=пн, 6=вс
 
 # ===== КОЛОДА БОГИНЬ =====
 # 40 богинь из игры "Дочь Богини"
@@ -339,6 +352,50 @@ def get_goddess_of_the_week(user_id: int, week_number: int = None) -> dict:
     return GODDESSES[index]
 
 
+# ===== БАЗА ПОДПИСЧИКОВ =====
+
+def init_db():
+    """Создаёт БД подписчиков, если её ещё нет."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("""
+        CREATE TABLE IF NOT EXISTS subscribers (
+            user_id INTEGER PRIMARY KEY,
+            first_name TEXT,
+            added_at TEXT DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    conn.commit()
+    conn.close()
+    logger.info(f"📂 База подписчиков: {DB_PATH}")
+
+
+def add_subscriber(user_id: int, first_name: str = ""):
+    """Добавляет пользователя в подписчики (если его там нет)."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute(
+        "INSERT OR IGNORE INTO subscribers (user_id, first_name) VALUES (?, ?)",
+        (user_id, first_name),
+    )
+    conn.commit()
+    conn.close()
+
+
+def remove_subscriber(user_id: int):
+    """Удаляет пользователя из подписчиков (например, если он заблокировал бота)."""
+    conn = sqlite3.connect(DB_PATH)
+    conn.execute("DELETE FROM subscribers WHERE user_id = ?", (user_id,))
+    conn.commit()
+    conn.close()
+
+
+def get_all_subscribers() -> list[int]:
+    """Возвращает список всех подписчиков."""
+    conn = sqlite3.connect(DB_PATH)
+    rows = conn.execute("SELECT user_id FROM subscribers").fetchall()
+    conn.close()
+    return [row[0] for row in rows]
+
+
 def format_goddess_caption(goddess: dict) -> str:
     """Форматирует подпись к картинке богини."""
     world_emoji = {"Навь": "🌒", "Явь": "🌓", "Правь": "🌕"}
@@ -354,55 +411,122 @@ def format_goddess_caption(goddess: dict) -> str:
     )
 
 
-async def send_goddess_card(update: Update, goddess: dict):
+async def send_card_to_user(bot, user_id: int, goddess: dict) -> bool:
     """
-    Отправляет карту богини: картинку с подписью.
-    Если картинка не найдена — отправляет только текст.
+    Отправляет карту богини конкретному пользователю по его ID.
+    Универсальная: используется и для команды /card, и для рассылки.
+    Возвращает True если успешно, False если не удалось.
     """
     caption = format_goddess_caption(goddess)
     image_path = CARDS_DIR / goddess["image"]
 
-    if image_path.exists():
-        try:
+    try:
+        if image_path.exists():
             with open(image_path, "rb") as photo:
-                await update.message.reply_photo(
+                await bot.send_photo(
+                    chat_id=user_id,
                     photo=photo,
                     caption=caption,
                     parse_mode="HTML",
                 )
-            return
-        except Exception as e:
-            logger.error(f"Ошибка при отправке картинки {image_path}: {e}")
+        else:
+            logger.warning(f"Картинка не найдена: {image_path}")
+            await bot.send_message(
+                chat_id=user_id,
+                text=caption,
+                parse_mode="HTML",
+            )
+        return True
+    except Forbidden:
+        # Пользователь заблокировал бота — удаляем из подписчиков
+        logger.info(f"Пользователь {user_id} заблокировал бота, удаляем.")
+        remove_subscriber(user_id)
+        return False
+    except BadRequest as e:
+        logger.error(f"Не удалось отправить {user_id}: {e}")
+        return False
+    except Exception as e:
+        logger.error(f"Неожиданная ошибка при отправке {user_id}: {e}")
+        return False
 
-    # Fallback: если картинки нет или не отправилась — только текст
-    logger.warning(f"Картинка не найдена: {image_path}")
-    await update.message.reply_text(caption, parse_mode="HTML")
+
+# ===== ВОСКРЕСНАЯ РАССЫЛКА =====
+
+async def broadcast_weekly_card(context: ContextTypes.DEFAULT_TYPE):
+    """
+    Рассылает карту недели всем подписчикам.
+    Запускается планировщиком каждое воскресенье в 20:00 по Москве.
+    """
+    subscribers = get_all_subscribers()
+    logger.info(f"🔔 Начинаю рассылку для {len(subscribers)} подписчиков")
+
+    sent = 0
+    failed = 0
+
+    # Интро-сообщение перед картой (необязательно, но красиво)
+    intro_text = (
+        "🌿 <b>Твоя богиня недели пришла</b>\n\n"
+        "<i>Новая неделя начинается завтра — "
+        "прими это послание как напутствие в путь.</i>"
+    )
+
+    for user_id in subscribers:
+        try:
+            # Сначала короткое интро
+            await context.bot.send_message(
+                chat_id=user_id,
+                text=intro_text,
+                parse_mode="HTML",
+            )
+            # Потом сама карта
+            goddess = get_goddess_of_the_week(user_id)
+            ok = await send_card_to_user(context.bot, user_id, goddess)
+            if ok:
+                sent += 1
+            else:
+                failed += 1
+        except Forbidden:
+            remove_subscriber(user_id)
+            failed += 1
+        except Exception as e:
+            logger.error(f"Ошибка при рассылке для {user_id}: {e}")
+            failed += 1
+
+    logger.info(f"✅ Рассылка завершена: {sent} отправлено, {failed} с ошибкой")
+
 
 
 # ===== ОБРАБОТЧИКИ КОМАНД =====
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Команда /start — приветствие."""
+    """Команда /start — приветствие + подписка на рассылку."""
     user = update.effective_user
+
+    # Добавляем в подписчиков
+    add_subscriber(user.id, user.first_name or "")
+
     welcome = (
         f"Здравствуй, {user.first_name}! 🌿\n\n"
         "Я — проводница славянских богинь из колоды <b>«Дочь Богини»</b>.\n\n"
-        "Каждую неделю я буду выбирать для тебя одну богиню — "
+        "Каждое воскресенье вечером я буду присылать тебе богиню недели — "
         "с напутствием и вопросом для размышления.\n\n"
         "<b>Команды:</b>\n"
-        "/card — карта недели\n"
+        "/card — карта этой недели\n"
         "/about — о колоде\n"
         "/help — помощь\n\n"
-        "Чтобы получить свою первую карту — напиши /card"
+        "Чтобы получить свою первую карту прямо сейчас — напиши /card"
     )
     await update.message.reply_text(welcome, parse_mode="HTML")
 
 
 async def card(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /card — выдать карту недели с картинкой."""
-    user_id = update.effective_user.id
-    goddess = get_goddess_of_the_week(user_id)
-    await send_goddess_card(update, goddess)
+    user = update.effective_user
+    # На всякий случай подписываем (вдруг нажал /card без /start)
+    add_subscriber(user.id, user.first_name or "")
+
+    goddess = get_goddess_of_the_week(user.id)
+    await send_card_to_user(context.bot, user.id, goddess)
 
 
 async def about(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -424,10 +548,11 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Команда /help."""
     text = (
         "<b>Как пользоваться ботом:</b>\n\n"
-        "/card — карта недели с напутствием\n"
+        "/card — карта этой недели с напутствием\n"
         "/about — рассказать о колоде\n"
         "/start — начать заново\n\n"
-        "Карта меняется каждый понедельник в 00:00 (по ISO-неделям)."
+        "🔔 Каждое воскресенье в 20:00 по Москве "
+        "я сама присылаю тебе богиню недели."
     )
     await update.message.reply_text(text, parse_mode="HTML")
 
@@ -439,6 +564,9 @@ def main():
         print("❌ Ошибка: сначала вставьте токен бота в переменную BOT_TOKEN")
         print("   или установите переменную окружения BOT_TOKEN")
         return
+
+    # Инициализируем БД подписчиков
+    init_db()
 
     # Проверяем папку с картинками
     if not CARDS_DIR.exists():
@@ -457,6 +585,25 @@ def main():
     app.add_handler(CommandHandler("card", card))
     app.add_handler(CommandHandler("about", about))
     app.add_handler(CommandHandler("help", help_command))
+
+    # Планировщик: рассылка каждое воскресенье в 20:00 по Москве
+    job_queue = app.job_queue
+    if job_queue is not None:
+        job_queue.run_daily(
+            broadcast_weekly_card,
+            time=BROADCAST_TIME,
+            days=(BROADCAST_WEEKDAY,),  # 0=пн ... 6=вс
+            name="weekly_broadcast",
+        )
+        logger.info(
+            f"⏰ Рассылка запланирована: воскресенье в "
+            f"{BROADCAST_TIME.strftime('%H:%M')} по Москве"
+        )
+    else:
+        logger.warning(
+            "⚠️  JobQueue недоступен — рассылка не запустится. "
+            "Установите python-telegram-bot[job-queue]"
+        )
 
     print("✨ Бот «Дочь Богини» запущен. Нажмите Ctrl+C для остановки.")
     app.run_polling()
