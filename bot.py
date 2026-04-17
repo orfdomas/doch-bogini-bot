@@ -38,13 +38,17 @@ CARDS_DIR = Path(__file__).parent / "cards"
 
 # ===== БАЗА ПОДПИСЧИКОВ =====
 # SQLite-файл с ID всех пользователей, которым нужно рассылать карту
-DB_PATH = Path(os.getenv("DATA_DIR", Path(__file__).parent)) / "subscribers.db"
+DB_PATH = Path(__file__).parent / "subscribers.db"
 
 # ===== РАСПИСАНИЕ РАССЫЛКИ =====
 # Московское время (UTC+3), воскресенье 20:00
 MOSCOW_TZ = timezone(timedelta(hours=3))
 BROADCAST_TIME = time(hour=20, minute=0, tzinfo=MOSCOW_TZ)
 BROADCAST_WEEKDAY = 6  # 0=пн, 6=вс
+
+# ===== АДМИНИСТРАТОР =====
+# Ваш Telegram ID — только вы можете вызывать команду /stats
+ADMIN_USER_ID = 214798742
 
 # ===== КОЛОДА БОГИНЬ =====
 # 40 богинь из игры "Дочь Богини"
@@ -557,6 +561,52 @@ async def help_command(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text(text, parse_mode="HTML")
 
 
+async def stats(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Команда /stats — статистика подписчиков (только для админа)."""
+    user_id = update.effective_user.id
+
+    # Проверка: только админ может видеть статистику
+    if user_id != ADMIN_USER_ID:
+        await update.message.reply_text(
+            "Эта команда доступна только владельцу бота."
+        )
+        return
+
+    # Считаем подписчиков
+    conn = sqlite3.connect(DB_PATH)
+    total = conn.execute("SELECT COUNT(*) FROM subscribers").fetchone()[0]
+
+    # Последние 5 подписчиков для контекста
+    recent = conn.execute(
+        "SELECT first_name, added_at FROM subscribers "
+        "ORDER BY added_at DESC LIMIT 5"
+    ).fetchall()
+
+    # Подписчики за последние 7 дней
+    last_week = conn.execute(
+        "SELECT COUNT(*) FROM subscribers "
+        "WHERE added_at >= datetime('now', '-7 days')"
+    ).fetchone()[0]
+
+    conn.close()
+
+    text = (
+        f"📊 <b>Статистика бота</b>\n\n"
+        f"👥 Всего подписчиков: <b>{total}</b>\n"
+        f"✨ Новых за неделю: <b>{last_week}</b>\n\n"
+    )
+
+    if recent:
+        text += "<b>Последние подписчики:</b>\n"
+        for name, added_at in recent:
+            name = name or "—"
+            # Оставим только дату без секунд
+            date_part = added_at.split(".")[0] if added_at else ""
+            text += f"• {name} ({date_part})\n"
+
+    await update.message.reply_text(text, parse_mode="HTML")
+
+
 # ===== ЗАПУСК БОТА =====
 
 def main():
@@ -585,6 +635,7 @@ def main():
     app.add_handler(CommandHandler("card", card))
     app.add_handler(CommandHandler("about", about))
     app.add_handler(CommandHandler("help", help_command))
+    app.add_handler(CommandHandler("stats", stats))
 
     # Планировщик: рассылка каждое воскресенье в 20:00 по Москве
     job_queue = app.job_queue
